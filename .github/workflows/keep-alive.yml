@@ -1,0 +1,64 @@
+name: Keep Repository Active (Prevent GitHub Actions Pause)
+
+# This workflow prevents GitHub from disabling your Actions due to inactivity
+on:
+  schedule:
+    # Run every 50 days (GitHub disables after 60 days of inactivity)
+    - cron: "0 12 */50 * *"
+    
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 🔄 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🕐 Update timestamp to keep repo active
+        run: |
+          # Create or update a keep-alive file
+          mkdir -p .github
+          echo "# Repository Activity Tracker" > .github/keep-alive.md
+          echo "" >> .github/keep-alive.md
+          echo "This file is automatically updated to keep GitHub Actions active." >> .github/keep-alive.md
+          echo "" >> .github/keep-alive.md
+          echo "**Last Updated:** $(date)" >> .github/keep-alive.md
+          echo "**Workflow Run:** #${{ github.run_number }}" >> .github/keep-alive.md
+          echo "**Purpose:** Prevent GitHub Actions from being disabled due to inactivity" >> .github/keep-alive.md
+          echo "" >> .github/keep-alive.md
+          echo "## Recent Activity Log" >> .github/keep-alive.md
+          echo "- $(date): Keep-alive workflow executed" >> .github/keep-alive.md
+          
+          # Append to activity log if it exists
+          if [ -f .github/activity.log ]; then
+            echo "" >> .github/keep-alive.md
+            echo "## Inventory Update History (Last 10)" >> .github/keep-alive.md
+            echo '```' >> .github/keep-alive.md
+            tail -10 .github/activity.log >> .github/keep-alive.md
+            echo '```' >> .github/keep-alive.md
+          fi
+
+      - name: 📝 Commit keep-alive update
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action Keep-Alive"
+          
+          git add .github/keep-alive.md
+          
+          if ! git diff --cached --quiet; then
+            git commit -m "🤖 Keep-alive: Update activity timestamp $(date +'%Y-%m-%d')"
+            git push
+            echo "✅ Repository activity updated successfully"
+          else
+            echo "ℹ️ No changes to commit"
+          fi
+
+      - name: 🎯 Verification
+        run: |
+          echo "🔄 Keep-alive workflow completed"
+          echo "📅 Next execution: In 50 days"
+          echo "✅ GitHub Actions will remain active"
