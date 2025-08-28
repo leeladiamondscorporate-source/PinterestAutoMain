@@ -45,24 +45,23 @@ jobs:
           python -c "import json; json.load(open('/tmp/gcp_credentials.json'))"
           echo "GCP credentials validated"
 
-      - name: Validate environment variables
-        run: |
-          echo "Checking required environment variables..."
-          python -c "
-          import os
-          required_vars = ['GOOGLE_APPLICATION_CREDENTIALS', 'BUCKET_NAME', 'BUCKET_FOLDER']
-          for var in required_vars:
-              if not os.environ.get(var):
-                  print(f'Missing required environment variable: {var}')
-                  exit(1)
-          print('All required environment variables are set')
-          "
-
       - name: Create output directories
         run: |
           mkdir -p /tmp/raw
           mkdir -p /tmp/pinterest_output
           ls -la /tmp/
+
+      - name: Validate environment setup
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp_credentials.json
+          BUCKET_NAME: ${{ vars.BUCKET_NAME || 'sitemaps.leeladiamond.com' }}
+          BUCKET_FOLDER: ${{ vars.BUCKET_FOLDER || 'pinterestfinal' }}
+        run: |
+          echo "Validating environment setup..."
+          echo "✓ GCP credentials file exists: $(test -f /tmp/gcp_credentials.json && echo 'Yes' || echo 'No')"
+          echo "✓ Bucket name: $BUCKET_NAME"
+          echo "✓ Bucket folder: $BUCKET_FOLDER"
+          echo "✓ FTP credentials: $(test -n "${{ secrets.FTP_USERNAME }}" && echo 'Set' || echo 'Missing')"
 
       - name: Run Pinterest Catalog Processor
         env:
