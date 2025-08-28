@@ -1,38 +1,138 @@
-name: Run Pinterest Workflow Every Two Days
+name: Pinterest Diamond Catalog Processor
 
 on:
   schedule:
-    - cron: "0 1 * * *"  # Runs at midnight every day
+    - cron: "0 1 * * *"  # Runs daily at 1:00 AM UTC
   workflow_dispatch:      # Allows manual triggering
+    inputs:
+      debug_mode:
+        description: 'Enable debug logging'
+        required: false
+        default: 'false'
+        type: boolean
 
 jobs:
-  run-script:
+  process-diamond-catalog:
     runs-on: ubuntu-latest
+    timeout-minutes: 30  # Set timeout to prevent hanging jobs
+    
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4  # Updated to latest version
 
       - name: Set up Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v4  # Updated to latest version
         with:
-          python-version: '3.9'
+          python-version: '3.11'  # Updated to more recent Python version
+          cache: 'pip'  # Enable pip caching for faster builds
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Verify dependencies
+        run: |
+          pip list
+          python -c "import pandas, google.cloud.storage, requests; print('All dependencies imported successfully')"
 
       - name: Set up Google Cloud Credentials
         env:
           GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
         run: |
           echo "$GCP_CREDENTIALS" > /tmp/gcp_credentials.json
+          # Validate the JSON structure
+          python -c "import json; json.load(open('/tmp/gcp_credentials.json'))"
+          echo "GCP credentials validated"
 
-      - name: Run Pinterest Script
+      - name: Validate environment variables
+        run: |
+          echo "Checking required environment variables..."
+          python -c "
+          import os
+          required_vars = ['GOOGLE_APPLICATION_CREDENTIALS', 'BUCKET_NAME', 'BUCKET_FOLDER']
+          for var in required_vars:
+              if not os.environ.get(var):
+                  print(f'Missing required environment variable: {var}')
+                  exit(1)
+          print('All required environment variables are set')
+          "
+
+      - name: Create output directories
+        run: |
+          mkdir -p /tmp/raw
+          mkdir -p /tmp/pinterest_output
+          ls -la /tmp/
+
+      - name: Run Pinterest Catalog Processor
         env:
           GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp_credentials.json
-          BUCKET_NAME: sitemaps.leeladiamond.com
-          BUCKET_FOLDER: pinterestfinal
+          BUCKET_NAME: ${{ vars.BUCKET_NAME || 'sitemaps.leeladiamond.com' }}
+          BUCKET_FOLDER: ${{ vars.BUCKET_FOLDER || 'pinterestfinal' }}
           OUTPUT_FOLDER: /tmp/pinterest_output
           FTP_DOWNLOAD_DIR: /tmp/raw
-        run: python main.py
+          FTP_SERVER: ${{ vars.FTP_SERVER || 'ftp.nivoda.net' }}
+          FTP_PORT: ${{ vars.FTP_PORT || '21' }}
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          EXCHANGE_RATE_API_KEY: ${{ secrets.EXCHANGE_RATE_API_KEY || '20155ba28afe7c763416cc23' }}
+          PYTHONUNBUFFERED: 1  # Ensure Python output is not buffered
+        run: |
+          echo "Starting Pinterest catalog processing..."
+          python main.py
+          echo "Processing completed"
+
+      - name: Check output files
+        run: |
+          echo "Checking generated files..."
+          ls -la /tmp/pinterest_output/ || echo "No output files found"
+          
+          if [ -d "/tmp/pinterest_output" ] && [ "$(ls -A /tmp/pinterest_output)" ]; then
+            echo "Generated files:"
+            for file in /tmp/pinterest_output/*; do
+              echo "- $(basename "$file"): $(wc -l < "$file") lines"
+            done
+          else
+            echo "No files were generated"
+          fi
+
+      - name: Upload logs as artifacts (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: processing-logs
+          path: |
+            /tmp/raw/
+            /tmp/pinterest_output/
+          retention-days: 7
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::Pinterest catalog processing failed. Check the logs for details."
+          echo "::notice::Uploaded artifacts contain raw files and any generated output for debugging."
+
+      - name: Clean up credentials
+        if: always()
+        run: |
+          rm -f /tmp/gcp_credentials.json
+          echo "Cleaned up temporary credentials"
+
+# Optional: Add a separate job for monitoring
+  monitor-processing:
+    needs: process-diamond-catalog
+    runs-on: ubuntu-latest
+    if: always()  # Run regardless of previous job status
+    
+    steps:
+      - name: Report processing status
+        run: |
+          if [ "${{ needs.process-diamond-catalog.result }}" == "success" ]; then
+            echo "✅ Pinterest catalog processing completed successfully"
+          elif [ "${{ needs.process-diamond-catalog.result }}" == "failure" ]; then
+            echo "❌ Pinterest catalog processing failed"
+          elif [ "${{ needs.process-diamond-catalog.result }}" == "cancelled" ]; then
+            echo "⚠️ Pinterest catalog processing was cancelled"
+          else
+            echo "ℹ️ Pinterest catalog processing status: ${{ needs.process-diamond-catalog.result }}"
+          fi
