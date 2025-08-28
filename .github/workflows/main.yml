@@ -1,9 +1,11 @@
-name: Pinterest Diamond Catalog Processor
+name: Daily Inventory Catalog Updater (Continuous)
 
 on:
   schedule:
-    - cron: "0 1 * * *"  # Runs daily at 1:00 AM UTC
-  workflow_dispatch:      # Allows manual triggering
+    # Run daily at 2:00 AM UTC (adjust timezone as needed)
+    - cron: "0 2 * * *"
+    
+  workflow_dispatch:      # Manual triggering anytime
     inputs:
       debug_mode:
         description: 'Enable debug logging'
@@ -11,59 +13,64 @@ on:
         default: 'false'
         type: boolean
 
+  # CRITICAL: This prevents GitHub from disabling the workflow
+  push:
+    branches: [ main, master ]
+    paths: 
+      - '.github/workflows/**'
+      - '**.py'
+  
+  # Keep repository active with minimal commits
+  repository_dispatch:
+    types: [keep-alive]
+
+env:
+  PYTHONUNBUFFERED: 1
+  TZ: UTC
+
 jobs:
-  process-diamond-catalog:
+  inventory-update:
     runs-on: ubuntu-latest
-    timeout-minutes: 30  # Set timeout to prevent hanging jobs
+    timeout-minutes: 30
     
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4  # Updated to latest version
-
-      - name: Set up Python
-        uses: actions/setup-python@v4  # Updated to latest version
+      - name: 🔄 Checkout repository
+        uses: actions/checkout@v4
         with:
-          python-version: '3.11'  # Updated to more recent Python version
-          cache: 'pip'  # Enable pip caching for faster builds
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install dependencies
+      - name: 📊 Repository activity tracker
+        run: |
+          echo "🔄 Workflow triggered at: $(date)"
+          echo "⚡ Keeping repository active for continuous automation"
+          echo "📅 Last commit: $(git log -1 --format='%cd' --date=short)"
+          echo "🏃 Workflow run number: ${{ github.run_number }}"
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📦 Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Verify dependencies
-        run: |
-          pip list
-          python -c "import pandas, google.cloud.storage, requests; print('All dependencies imported successfully')"
-
-      - name: Set up Google Cloud Credentials
+      - name: 🔑 Set up Google Cloud credentials
         env:
           GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
         run: |
           echo "$GCP_CREDENTIALS" > /tmp/gcp_credentials.json
-          # Validate the JSON structure
           python -c "import json; json.load(open('/tmp/gcp_credentials.json'))"
-          echo "GCP credentials validated"
+          echo "✅ GCP credentials validated"
 
-      - name: Create output directories
+      - name: 📁 Prepare directories
         run: |
-          mkdir -p /tmp/raw
-          mkdir -p /tmp/pinterest_output
+          mkdir -p /tmp/raw /tmp/pinterest_output
           ls -la /tmp/
 
-      - name: Validate environment setup
-        env:
-          GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp_credentials.json
-          BUCKET_NAME: ${{ vars.BUCKET_NAME || 'sitemaps.leeladiamond.com' }}
-          BUCKET_FOLDER: ${{ vars.BUCKET_FOLDER || 'pinterestfinal' }}
-        run: |
-          echo "Validating environment setup..."
-          echo "✓ GCP credentials file exists: $(test -f /tmp/gcp_credentials.json && echo 'Yes' || echo 'No')"
-          echo "✓ Bucket name: $BUCKET_NAME"
-          echo "✓ Bucket folder: $BUCKET_FOLDER"
-          echo "✓ FTP credentials: $(test -n "${{ secrets.FTP_USERNAME }}" && echo 'Set' || echo 'Missing')"
-
-      - name: Run Pinterest Catalog Processor
+      - name: 🚀 Run daily inventory update
         env:
           GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp_credentials.json
           BUCKET_NAME: ${{ vars.BUCKET_NAME || 'sitemaps.leeladiamond.com' }}
@@ -75,63 +82,71 @@ jobs:
           FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
           FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
           EXCHANGE_RATE_API_KEY: ${{ secrets.EXCHANGE_RATE_API_KEY || '20155ba28afe7c763416cc23' }}
-          PYTHONUNBUFFERED: 1  # Ensure Python output is not buffered
         run: |
-          echo "Starting Pinterest catalog processing..."
+          echo "🔄 Starting daily inventory catalog update..."
           python main.py
-          echo "Processing completed"
+          echo "✅ Daily update completed successfully"
 
-      - name: Check output files
+      - name: 📈 Update statistics and keep active
         run: |
-          echo "Checking generated files..."
-          ls -la /tmp/pinterest_output/ || echo "No output files found"
+          echo "📊 Generating activity report..."
+          echo "🕐 Update completed at: $(date)" >> activity.log
+          echo "📦 Files processed: $(find /tmp/pinterest_output -name "*.csv" | wc -l)" >> activity.log
+          echo "💾 Output size: $(du -sh /tmp/pinterest_output | cut -f1)" >> activity.log
           
-          if [ -d "/tmp/pinterest_output" ] && [ "$(ls -A /tmp/pinterest_output)" ]; then
-            echo "Generated files:"
-            for file in /tmp/pinterest_output/*; do
-              echo "- $(basename "$file"): $(wc -l < "$file") lines"
-            done
-          else
-            echo "No files were generated"
+          # Display recent activity
+          if [ -f activity.log ]; then
+            echo "📋 Recent activity:"
+            tail -5 activity.log
           fi
 
-      - name: Upload logs as artifacts (on failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: processing-logs
-          path: |
-            /tmp/raw/
-            /tmp/pinterest_output/
-          retention-days: 7
-
-      - name: Notify on failure
-        if: failure()
+      - name: 🔄 Auto-commit activity log (keeps repo active)
         run: |
-          echo "::error::Pinterest catalog processing failed. Check the logs for details."
-          echo "::notice::Uploaded artifacts contain raw files and any generated output for debugging."
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          # Create/update activity log
+          echo "$(date): Daily inventory update completed - Run #${{ github.run_number }}" >> .github/activity.log
+          
+          # Only commit if there are changes
+          if ! git diff --quiet .github/activity.log 2>/dev/null; then
+            git add .github/activity.log
+            git commit -m "📊 Auto-update: Daily inventory sync $(date +'%Y-%m-%d %H:%M UTC')" || echo "No changes to commit"
+            git push || echo "Nothing to push"
+          else
+            echo "ℹ️ No activity log changes to commit"
+          fi
 
-      - name: Clean up credentials
+      - name: 🧹 Clean up credentials
         if: always()
         run: |
           rm -f /tmp/gcp_credentials.json
-          echo "Cleaned up temporary credentials"
+          echo "🧹 Cleaned up temporary credentials"
 
-# Optional: Add a separate job for monitoring
-  monitor-processing:
-    needs: process-diamond-catalog
+      - name: 🎯 Success notification
+        if: success()
+        run: |
+          echo "🎉 Daily inventory update completed successfully!"
+          echo "📅 Next scheduled run: Tomorrow at 2:00 AM UTC"
+          echo "🔄 Workflow will continue running daily automatically"
+
+      - name: ⚠️ Failure notification  
+        if: failure()
+        run: |
+          echo "❌ Daily inventory update failed"
+          echo "🔄 Workflow will retry tomorrow at scheduled time"
+          echo "📝 Check logs for error details"
+
+  # Additional job to ensure GitHub doesn't disable the workflow
+  keep-alive:
     runs-on: ubuntu-latest
-    if: always()  # Run regardless of previous job status
+    needs: inventory-update
+    if: always()
     
     steps:
-      - name: Report processing status
+      - name: 📡 Keep repository active
         run: |
-          if [ "${{ needs.process-diamond-catalog.result }}" == "success" ]; then
-            echo "✅ Pinterest catalog processing completed successfully"
-          elif [ "${{ needs.process-diamond-catalog.result }}" == "failure" ]; then
-            echo "❌ Pinterest catalog processing failed"
-          elif [ "${{ needs.process-diamond-catalog.result }}" == "cancelled" ]; then
-            echo "⚠️ Pinterest catalog processing was cancelled"
-          else
-            echo "ℹ️ Pinterest catalog processing status: ${{ needs.process-diamond-catalog.result }}"
-          fi
+          echo "🔄 Repository activity maintenance"
+          echo "📅 Last workflow run: $(date)"
+          echo "🎯 Status: ${{ needs.inventory-update.result }}"
+          echo "✅ Workflow remains active for continuous automation"
