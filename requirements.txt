@@ -1,4 +1,12 @@
-pandas
-google-cloud-storage
-Flask
-requests
+# Core data processing
+pandas>=2.1.0,<3.0.0
+numpy>=1.24.0,<2.0.0
+
+# Google Cloud Storage
+google-cloud-storage>=2.10.0,<3.0.0
+
+# HTTP requests
+requests>=2.31.0,<3.0.0
+
+# Web framework (if needed for local testing)
+Flask>=2.3.0,<3
