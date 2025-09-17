@@ -113,46 +113,16 @@ class DiamondCatalogProcessor:
         logger.info(f"Downloaded {success_count}/{len(self.ftp_files)} files successfully")
         return success_count == len(self.ftp_files)
 
-    def calculate_markup(self, price: float) -> float:
-        """Calculate markup with improved accuracy using Decimal for precise calculations."""
-        try:
-            # Convert to Decimal for precise calculations
-            price_decimal = Decimal(str(price))
-            
-            # Base markup: 5% + 13% tax
-            base = price_decimal * Decimal('1.05') * Decimal('1.13')
-            
-            # Additional markup based on price tiers
-            if price <= 500:
-                additional = Decimal('210')
-            elif price <= 1000:
-                additional = Decimal('375')
-            elif price <= 1500:
-                additional = Decimal('500')
-            elif price <= 2000:
-                additional = Decimal('700')
-            elif price <= 2500:
-                additional = Decimal('900')
-            elif price <= 3000:
-                additional = Decimal('1100')
-            elif price <= 5000:
-                additional = Decimal('1200')
-            elif price <= 100000:
-                additional = Decimal('1500')
-            else:
-                additional = Decimal('0')
-            
-            # Apply additional 15% markup to the additional amount
-            additional = additional * Decimal('1.15')
-            
-            total = base + additional
-            
-            # Round to 2 decimal places
-            return float(total.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
-            
-        except Exception as e:
-            logger.error(f"Error calculating markup for price {price}: {e}")
-            return price
+    def convert_to_cad(price_usd):
+    """Convert price from USD to CAD using a fixed exchange rate."""
+    cad_rate = 1.41  # set via ENV or config if needed
+    try:
+        price_usd = float(price_usd)  # ensure numeric
+        return round(price_usd * cad_rate, 2)
+    except (ValueError, TypeError) as e:
+        print(f"[WARN] Currency conversion skipped for invalid value {price_usd}: {e}")
+        return 0.0  # safer fallback
+
 
     def clean_and_validate_data(self, df: pd.DataFrame, product_type: str) -> pd.DataFrame:
         """Clean and validate the data with improved accuracy."""
@@ -231,8 +201,19 @@ class DiamondCatalogProcessor:
                 logger.warning(f"No valid data remaining in {product_type} file after cleaning")
                 return pd.DataFrame()
             
-            # Apply markup to prices
-            df['price'] = df['price'].apply(self.calculate_markup)
+           # ---- PRICE: convert existing markupPrice (assumed USD) -> CAD; show on 'price' ----
+            if 'markupPrice' in df.columns:
+                df['markupPrice'] = pd.to_numeric(df['markupPrice'], errors='coerce')
+            else:
+                # create a zero series if the column doesn't exist
+                df['markupPrice'] = pd.Series(0.0, index=df.index)
+            
+            df['markupPrice'] = df['markupPrice'].fillna(0.0).astype(float)
+            df['markupPrice'] = df['markupPrice'].apply(convert_to_cad)
+            
+            # Google Merchant Center price format
+            df['price'] = df['markupPrice'].map(lambda x: f"{x:.2f} CAD")
+            df['markupCurrency'] = 'CAD'
             
             # Generate unique IDs
             df['id'] = df['ReportNo'].astype(str) + "CA"
@@ -258,10 +239,26 @@ class DiamondCatalogProcessor:
                 "description": lambda row: f"Discover sustainable luxury with our natural {row.get('shape', 'diamond')}: {row.get('carats', '')} carats, {row.get('col', '')} color, and {row.get('clar', '')} clarity. Perfect for custom jewelry creations. Measurements: {row.get('length', '')}-{row.get('width', '')}x{row.get('height', '')} mm. Cut: {row.get('cut', '')}, Polish: {row.get('pol', '')}, Symmetry: {row.get('symm', '')}, Table: {row.get('table', '')}%, Depth: {row.get('depth', '')}%, Fluorescence: {row.get('flo', '')}. {row.get('lab', '')} certified natural diamond.",
                 "link": lambda row: f"https://leeladiamond.com/pages/natural-diamond-catalog?id={row.get('ReportNo', '')}"
             },
-            "lab_grown": {
-                "title": lambda row: f"{row.get('shape', 'Diamond')} {row.get('carats', '')} Carats {row.get('col', '')} Color {row.get('clar', '')} Clarity {row.get('lab', '')} Certified Lab Grown Diamond",
-                "description": lambda row: f"Discover sustainable luxury with our lab-grown {row.get('shape', 'diamond')}: {row.get('carats', '')} carats, {row.get('col', '')} color, and {row.get('clar', '')} clarity. Perfect for ethical jewelry creations. Measurements: {row.get('length', '')}-{row.get('width', '')}x{row.get('height', '')} mm. Cut: {row.get('cut', '')}, Polish: {row.get('pol', '')}, Symmetry: {row.get('symm', '')}, Table: {row.get('table', '')}%, Depth: {row.get('depth', '')}%, Fluorescence: {row.get('flo', '')}. {row.get('lab', '')} certified lab-grown diamond.",
-                "link": lambda row: f"https://leeladiamond.com/pages/lab-grown-diamond-catalog?id={row.get('ReportNo', '')}"
+             "lab_grown": {
+                    "title": lambda row: f"{row.get('shape','')}-{row.get('carats','')} Carats-{row.get('col','')} Color-{row.get('clar','')} Clarity-{row.get('lab','')} Certified-{row.get('shape','')}-Lab Grown Diamond",
+                    "description": lambda row: (
+                        f"Discover sustainable luxury with our lab-grown {row.get('shape','')} diamond: "
+                        f"{row.get('carats','')} carats, {row.get('col','')} color, and {row.get('clar','')} clarity. "
+                        f"Measurements: {row.get('length','')}-{row.get('width','')}x{row.get('height','')} mm. "
+                        f"Cut: {row.get('cut','')}, Polish: {row.get('pol','')}, Symmetry: {row.get('symm','')}, "
+                        f"Table: {row.get('table','')}%, Depth: {row.get('depth','')}%, Fluorescence: {row.get('flo','')}. "
+                        f"{row.get('lab','')} certified {row.get('shape','')}"
+                    ),
+                    # SEO-friendly link (carats 1.50 -> 1-50, lowercased, hyphenated)
+                    "link": lambda row: (
+                        "https://leeladiamond.com/pages/lab-grown-diamonds/"
+                        f"{str(row.get('shape','')).strip().lower()}-"
+                        f"{str(row.get('carats','')).replace('.', '-')}-carat-"
+                        f"{str(row.get('col','')).strip().lower()}-color-"
+                        f"{str(row.get('clar','')).strip().lower()}-clarity-"
+                        f"{str(row.get('lab','')).strip().lower()}-certified-"
+                        f"{str(row.get('ReportNo','')).strip()}"
+                    )
             },
             "gemstone": {
                 "title": lambda row: f"{row.get('shape', '')} {row.get('Color', '')} {row.get('gemType', 'Gemstone')} - {row.get('carats', '')} Carats {row.get('Clarity', '')} Clarity {row.get('Lab', '')} Certified",
@@ -475,3 +472,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
