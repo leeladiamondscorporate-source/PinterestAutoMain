@@ -1,4 +1,5 @@
 import os
+import re
 import ftplib
 import pandas as pd
 import requests
@@ -8,7 +9,7 @@ import logging
 from typing import Dict, Optional
 import time
 from decimal import Decimal, ROUND_HALF_UP
-import re
+from typing import List
 
 # Configure logging
 logging.basicConfig(
@@ -18,8 +19,47 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ----------------------------
+# Helpers (shared)
+# ----------------------------
+IMG_RE = re.compile(r'(https?://[^\s",>]+?\.(?:jpg|jpeg|png|webp))', re.IGNORECASE)
+
+def extract_image_series(df: pd.DataFrame, col_name: str) -> pd.Series:
+    """
+    Always returns a pandas Series of strings (no ndarray).
+    Performs row-wise regex extraction of a direct image URL.
+    """
+    if col_name not in df.columns:
+        return pd.Series([""] * len(df), index=df.index)
+    return df[col_name].astype(str).apply(
+        lambda s: (IMG_RE.search(s).group(0) if IMG_RE.search(s) else "")
+    )
+
+def parse_money_to_float(series: pd.Series) -> pd.Series:
+    """
+    Parse money-like strings to floats. Strips currency words/symbols, commas,
+    stray chars; collapses multiple decimals.
+    """
+    def _clean(v):
+        if pd.isna(v):
+            return None
+        s = str(v).strip()
+        s = s.replace(",", "")
+        s = re.sub(r"(usd|cad|inr|aud|eur|gbp|jpy|chf|sek|mxn|brl|sgd|hkd|nzd|dkk|nok|£|€|\$)", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"[^0-9.\-]", "", s)
+        if s.count(".") > 1:
+            parts = s.split(".")
+            s = parts[0] + "." + "".join(parts[1:])
+        try:
+            return float(s) if s != "" else None
+        except Exception:
+            return None
+    out = series.map(_clean)
+    return pd.to_numeric(out, errors="coerce")
+
+
 class DiamondCatalogProcessor:
-    """Enhanced Diamond Catalog Processor with improved accuracy and error handling."""
+    """Pinterest feed generator with robust parsing, pricing, and country files."""
 
     def __init__(self):
         # FTP Configuration - Use environment variables for security
@@ -72,7 +112,7 @@ class DiamondCatalogProcessor:
         }
 
         # Pinterest-specific Google product categories for jewelry
-        self.jewelry_categories = [
+        self.jewelry_categories: List[int] = [
             189, 190, 191, 197, 192, 194, 6463, 196, 200,
             5122, 5123, 7471, 6870, 201, 502979, 6540,
             6102, 5996, 198, 5982
@@ -114,13 +154,19 @@ class DiamondCatalogProcessor:
     # ----------------------------
     # Pricing / Currency
     # ----------------------------
-    def convert_to_cad(self, price_usd):
-        """Convert price from USD to CAD using a fixed exchange rate."""
-        cad_rate = 1.41
+    @staticmethod
+    def usd_to_cad_rate() -> float:
         try:
-            return round(float(price_usd) * cad_rate, 2)
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Currency conversion skipped for invalid value {price_usd}: {e}")
+            return float(os.environ.get("USD_TO_CAD", "1.41"))
+        except Exception:
+            return 1.41
+
+    def convert_usd_to_cad_value(self, price_usd) -> float:
+        """Convert a single USD value to CAD with configured rate."""
+        rate = self.usd_to_cad_rate()
+        try:
+            return round(float(price_usd) * rate, 2)
+        except (ValueError, TypeError):
             return 0.0
 
     @staticmethod
@@ -135,20 +181,6 @@ class DiamondCatalogProcessor:
             amt = 0.0
         return f"{amt:.2f} {currency}"
 
-    @staticmethod
-    def _parse_price_number(value: str) -> float:
-        if value is None:
-            return 0.0
-        s = str(value).strip()
-        m = re.search(r'(\d+(?:[.,]\d+)*)', s)
-        if not m:
-            return 0.0
-        num = m.group(1).replace(',', '')
-        try:
-            return float(num)
-        except ValueError:
-            return 0.0
-
     # ----------------------------
     # Cleaning / Validation
     # ----------------------------
@@ -157,13 +189,12 @@ class DiamondCatalogProcessor:
         df = df.fillna('')
 
         # Require valid image for Pinterest
-        if 'image' in df.columns:
-            df['image'] = df['image'].str.extract(r'(https?://[^\s]+\.(?:jpg|jpeg|png|webp))', expand=False).fillna('')
-            before = len(df)
-            df = df[df['image'].str.len() > 0]
-            logger.info(f"Filtered {before - len(df)} rows without valid images")
+        img_series = extract_image_series(df, 'image') if 'image' in df.columns else pd.Series(['']*len(df))
+        before = len(df)
+        df = df[img_series.str.len() > 0].copy()
+        df['image'] = extract_image_series(df, 'image')
+        logger.info(f"Filtered {before - len(df)} rows without valid images")
 
-        # Do NOT filter by original 'price'—we compute price from markupPrice later.
         # Clean text fields
         for col in ['shape', 'col', 'clar', 'cut', 'pol', 'symm', 'lab']:
             if col in df.columns:
@@ -184,6 +215,83 @@ class DiamondCatalogProcessor:
         return df
 
     # ----------------------------
+    # Pricing logic per product_type (smart fallbacks)
+    # ----------------------------
+    def compute_price_cad(self, df: pd.DataFrame, product_type: str) -> pd.Series:
+        """
+        Detect price with ordered fallbacks:
+          1) markup_price / markupPrice
+          2) delivered_price / deliveredPrice
+          3) price
+          4) price_per_carat * carats (or pricePerCarat * carats)
+        Currency from markup_currency / markupCurrency (default USD).
+        Returns CAD series.
+        """
+        rate = self.usd_to_cad_rate()
+
+        if product_type == "lab_grown":
+            price_candidates = ["markupPrice", "deliveredPrice", "price"]
+            ppc_col = "pricePerCarat"
+            carats_col = "carats"
+            currency_col = "markupCurrency"
+        elif product_type == "natural":
+            price_candidates = ["markup_price", "delivered_price", "price"]
+            ppc_col = "price_per_carat"
+            carats_col = "carats"
+            currency_col = "markup_currency"
+        else:  # gemstone
+            price_candidates = ["markup_price", "price", "price_per_carat"]
+            ppc_col = "price_per_carat"
+            carats_col = "carats"
+            currency_col = "markup_currency"
+
+        # Ensure referenced columns exist
+        for c in set(price_candidates + [ppc_col, carats_col, currency_col]):
+            if c and c not in df.columns:
+                df[c] = ""
+
+        used_source = pd.Series([""] * len(df), index=df.index)
+        price_usd = pd.Series([None] * len(df), index=df.index, dtype="float64")
+
+        # Try direct price candidates
+        for cand in price_candidates:
+            series = parse_money_to_float(df[cand]) if cand in df.columns else pd.Series([None]*len(df))
+            take = price_usd.isna() & series.notna() & (series > 0)
+            price_usd.loc[take] = series.loc[take]
+            used_source.loc[take] = cand
+
+        # Fallback: price_per_carat * carats
+        missing = price_usd.isna() | (price_usd <= 0)
+        if missing.any():
+            ppc = parse_money_to_float(df[ppc_col]) if ppc_col in df.columns else pd.Series([None]*len(df))
+            carats = pd.to_numeric(df[carats_col], errors="coerce")
+            ppc_total = (ppc * carats).where(ppc.notna() & carats.notna(), other=None)
+            take_ppc = missing & ppc_total.notna() & (ppc_total > 0)
+            price_usd.loc[take_ppc] = ppc_total.loc[take_ppc]
+            used_source.loc[take_ppc] = f"{ppc_col}*{carats_col}"
+
+        # Currency handling
+        if currency_col in df.columns:
+            curr = df[currency_col].astype(str).str.strip().str.upper().replace({"": "USD"})
+        else:
+            curr = pd.Series(["USD"] * len(df), index=df.index)
+
+        # Convert to CAD
+        def to_cad(p, c):
+            if p is None or pd.isna(p) or p <= 0:
+                return 0.0
+            if c == "CAD":
+                return round(float(p), 2)
+            # everything else treated as USD
+            return round(float(p) * rate, 2)
+
+        price_cad = pd.Series([to_cad(p, c) for p, c in zip(price_usd, curr)], index=df.index)
+        price_cad = pd.to_numeric(price_cad, errors="coerce").fillna(0.0)
+
+        logger.info(f"[PRICE][{product_type}] rows={len(df)} | priced(>0 CAD)={(price_cad > 0).sum()} | sources={used_source.value_counts(dropna=False).to_dict()}")
+        return price_cad
+
+    # ----------------------------
     # Processing
     # ----------------------------
     def process_file(self, file_path: str, product_type: str) -> pd.DataFrame:
@@ -194,50 +302,62 @@ class DiamondCatalogProcessor:
                 logger.error(f"Missing or empty file: {file_path}")
                 return pd.DataFrame()
 
+            # Robust CSV read
             try:
-                df = pd.read_csv(file_path, dtype=str, encoding='utf-8')
+                df = pd.read_csv(file_path, dtype=str, low_memory=False)
             except UnicodeDecodeError:
-                df = pd.read_csv(file_path, dtype=str, encoding='latin-1')
+                df = pd.read_csv(file_path, dtype=str, low_memory=False, encoding='utf-8-sig')
 
             if df.empty:
                 logger.warning(f"No data in {product_type} file")
                 return pd.DataFrame()
 
+            # Ensure common columns exist
+            base_cols = ["shape","carats","col","clar","cut","pol","symm","flo","floCol",
+                         "length","width","height","depth","table","culet","lab","girdle",
+                         "ReportNo","image","video","pdf","diamondId","stockId","ID"]
+            gemstone_only = ["gemType","Treatment","Mine of Origin","mine_of_origin","mineOfOrigin","pdfUrl","price_per_carat","markup_price","markup_currency"]
+            natural_only  = ["price_per_carat","markup_price","markup_currency","mine_of_origin","canada_mark_eligible","is_returnable","delivered_price"]
+            lab_only      = ["pricePerCarat","markupPrice","markupCurrency","deliveredPrice","minDeliveryDays","maxDeliveryDays","mineOfOrigin","price"]
+
+            ensure_cols = set(base_cols + gemstone_only + natural_only + lab_only)
+            for c in ensure_cols:
+                if c not in df.columns:
+                    df[c] = ""
+
+            # Clean & validate (also enforces image existence)
             df = self.clean_and_validate_data(df, product_type)
             if df.empty:
                 logger.warning(f"No valid data remaining in {product_type} file after cleaning")
                 return pd.DataFrame()
 
-            # ---- PRICE PIPELINE (MANDATORY) ----
-            # Use markupPrice (USD). Convert to CAD. Drop rows with no usable price.
-            if 'markupPrice' not in df.columns:
-                df['markupPrice'] = 0
+            # Price pipeline (CAD)
+            df["price_cad"] = self.compute_price_cad(df, product_type)
 
-            df['markupPrice'] = pd.to_numeric(df['markupPrice'], errors='coerce').fillna(0.0)
-            df['price_cad'] = df['markupPrice'].apply(self.convert_to_cad)
-
-            # Drop rows with zero/invalid price to satisfy “Enter price values…” constraint
+            # Drop rows with zero/invalid price to satisfy Pinterest constraint
             before_pr = len(df)
-            df = df[df['price_cad'] > 0]
+            df = df[df["price_cad"] > 0].copy()
             dropped = before_pr - len(df)
             if dropped:
-                logger.info(f"Dropped {dropped} rows without valid price")
+                logger.info(f"Dropped {dropped} rows without valid price ({product_type})")
 
-            # Format for Merchant / Pinterest: '123.45 CAD'
-            df['price'] = df['price_cad'].apply(lambda x: self.format_price(x, 'CAD'))
-            df['markupCurrency'] = 'CAD'
+            # Format for Pinterest: '123.45 CAD'
+            df["price"] = df["price_cad"].map(lambda x: self.format_price(x, "CAD"))
 
-            # Generate unique IDs
-            df['id'] = df.get('ReportNo', '').astype(str) + "CA"
+            # Generate unique IDs (fallbacks for gemstones)
+            df["ReportNo"] = df["ReportNo"].astype(str).str.strip()
+            if product_type == "gemstone" and (df["ReportNo"] == "").all():
+                df["ReportNo"] = df["ID"].astype(str)
+            df["id"] = (df["ReportNo"].where(df["ReportNo"] != "", df["diamondId"].astype(str)) + "CA").fillna("")
 
-            # Product info
+            # Product info (titles/desc/links)
             df = self.apply_product_templates(df, product_type)
 
             # Pinterest fields
             df = self.add_pinterest_fields(df)
 
-            # Final safety: ensure no empty price strings remain
-            df = df[df['price'].astype(str).str.match(r'^\d+\.\d{2}\s[A-Z]{3}$', na=False)]
+            # Final safety: ensure valid price string
+            df = df[df["price"].astype(str).str.match(r'^\d+\.\d{2}\s[A-Z]{3}$', na=False)]
 
             logger.info(f"Successfully processed {len(df)} {product_type} products")
             return df
@@ -247,16 +367,21 @@ class DiamondCatalogProcessor:
             return pd.DataFrame()
 
     def apply_product_templates(self, df: pd.DataFrame, product_type: str) -> pd.DataFrame:
+        def meas(row):
+            L = row.get("length"); W = row.get("width"); H = row.get("height") or row.get("depth")
+            if L and W and H: return f"{L}-{W}x{H} mm"
+            if L and W:       return f"{L}x{W} mm"
+            return ""
+
         product_templates = {
             "natural": {
                 "title": lambda row: f"{row.get('shape', 'DIAMOND')} {row.get('carats', '')} Carats {row.get('col', '')} Color {row.get('clar', '')} Clarity {row.get('lab', '')} Certified Natural Diamond",
                 "description": lambda row: (
-                    f"Discover sustainable luxury with our natural {row.get('shape', 'diamond')}: "
-                    f"{row.get('carats', '')} carats, {row.get('col', '')} color, and {row.get('clar', '')} clarity. "
-                    f"Measurements: {row.get('length', '')}-{row.get('width', '')}x{row.get('height', '')} mm. "
-                    f"Cut: {row.get('cut', '')}, Polish: {row.get('pol', '')}, Symmetry: {row.get('symm', '')}, "
-                    f"Table: {row.get('table', '')}%, Depth: {row.get('depth', '')}%, Fluorescence: {row.get('flo', '')}. "
-                    f"{row.get('lab', '')} certified natural diamond."
+                    f"Natural {row.get('shape','')} diamond: {row.get('carats','')} carats, "
+                    f"{row.get('col','')} color, {row.get('clar','')} clarity. "
+                    f"Measurements: {meas(row)}. Cut: {row.get('cut','')}, Polish: {row.get('pol','')}, Symmetry: {row.get('symm','')}, "
+                    f"Table: {row.get('table','')}%, Depth: {row.get('depth','')}%, Fluorescence: {row.get('flo','') or row.get('floCol','')}. "
+                    f"{row.get('lab','')} certified."
                 ),
                 "link": lambda row: f"https://leeladiamond.com/pages/natural-diamond-catalog?id={row.get('ReportNo', '')}",
             },
@@ -267,12 +392,11 @@ class DiamondCatalogProcessor:
                     f"{row.get('lab','')} Certified Lab Grown Diamond"
                 ),
                 "description": lambda row: (
-                    f"Discover sustainable luxury with our lab-grown {row.get('shape','')} diamond: "
-                    f"{row.get('carats','')} carats, {row.get('col','')} color, and {row.get('clar','')} clarity. "
-                    f"Measurements: {row.get('length','')}-{row.get('width','')}x{row.get('height','')} mm. "
-                    f"Cut: {row.get('cut','')}, Polish: {row.get('pol','')}, Symmetry: {row.get('symm','')}, "
-                    f"Table: {row.get('table','')}%, Depth: {row.get('depth','')}%, Fluorescence: {row.get('flo','')}. "
-                    f"{row.get('lab','')} certified {row.get('shape','')}"
+                    f"Lab-grown {row.get('shape','')} diamond: {row.get('carats','')} carats, "
+                    f"{row.get('col','')} color, {row.get('clar','')} clarity. "
+                    f"Measurements: {meas(row)}. Cut: {row.get('cut','')}, Polish: {row.get('pol','')}, Symmetry: {row.get('symm','')}, "
+                    f"Table: {row.get('table','')}%, Depth: {row.get('depth','')}%, Fluorescence: {row.get('flo','') or row.get('floCol','')}. "
+                    f"{row.get('lab','')} certified."
                 ),
                 "link": lambda row: (
                     "https://leeladiamond.com/pages/lab-grown-diamonds/"
@@ -286,16 +410,17 @@ class DiamondCatalogProcessor:
             },
             "gemstone": {
                 "title": lambda row: (
-                    f"{row.get('shape', '')} {row.get('Color', '')} {row.get('gemType', 'Gemstone')} - "
-                    f"{row.get('carats', '')} Carats {row.get('Clarity', '')} Clarity {row.get('Lab', '')} Certified"
+                    f"{row.get('gemType', 'Gemstone')} {row.get('Color', '')} {row.get('shape', '')} – "
+                    f"{row.get('carats', '')} Carats, {row.get('Clarity', '')} Clarity, {row.get('Cut', '')} Cut, {row.get('Lab', '')} Certified"
                 ),
                 "description": lambda row: (
-                    f"Beautiful {row.get('shape', '')} {row.get('gemType', 'gemstone')} in {row.get('Color', '')} - "
-                    f"{row.get('carats', '')} carats with {row.get('Clarity', '')} clarity. "
-                    f"Cut: {row.get('Cut', '')}, Lab: {row.get('Lab', '')}, Treatment: {row.get('Treatment', '')}, "
-                    f"Origin: {row.get('Mine of Origin', '')}, Size: {row.get('length', '')}x{row.get('width', '')} mm."
+                    f"{row.get('gemType','')} gemstone in {row.get('Color','')} color, "
+                    f"{row.get('carats','')} carats. Measurements: {meas(row)}. "
+                    f"Clarity: {row.get('Clarity','')}, Cut: {row.get('Cut','')}, Lab: {row.get('Lab','')}. "
+                    f"Treatment: {(row.get('Treatment','') or 'N/A')}. "
+                    f"{'Origin: ' + row.get('Mine of Origin','') if row.get('Mine of Origin','') else ''}"
                 ),
-                "link": lambda row: f"https://leeladiamond.com/pages/gemstone-catalog?id={row.get('ReportNo', '')}",
+                "link": lambda row: f"https://leeladiamond.com/pages/gemstone-catalog?id={row.get('ReportNo', '') or row.get('ID','')}",
             },
         }
 
@@ -305,8 +430,8 @@ class DiamondCatalogProcessor:
             df['description'] = df.apply(template['description'], axis=1)
             df['link'] = df.apply(template['link'], axis=1)
 
-        df['title'] = df['title'].str.replace(r'\s+', ' ', regex=True).str.strip()
-        df['description'] = df['description'].str.replace(r'\s+', ' ', regex=True).str.strip()
+        df['title'] = df['title'].astype(str).str.replace(r'\s+', ' ', regex=True).str.strip()
+        df['description'] = df['description'].astype(str).str.replace(r'\s+', ' ', regex=True).str.strip()
         return df
 
     # ----------------------------
@@ -353,6 +478,19 @@ class DiamondCatalogProcessor:
             "INR": 74.0, "SGD": 1.35, "HKD": 7.8, "NZD": 1.60, "DKK": 6.3, "NOK": 8.8
         }
 
+    def _parse_price_number(self, value: str) -> float:
+        if value is None:
+            return 0.0
+        s = str(value).strip()
+        m = re.search(r'(\d+(?:[.,]\d+)*)', s)
+        if not m:
+            return 0.0
+        num = m.group(1).replace(',', '')
+        try:
+            return float(num)
+        except ValueError:
+            return 0.0
+
     def create_country_specific_files(self, combined_df: pd.DataFrame) -> None:
         logger.info("Creating country-specific files...")
         rates = self.get_exchange_rates()
@@ -360,6 +498,7 @@ class DiamondCatalogProcessor:
             logger.error("No exchange rates available, skipping country-specific file creation")
             return
 
+        # USD->CAD from API (for correct CAD->target conversion)
         usd_to_cad = Decimal(str(rates.get("CAD", 1))) or Decimal("1")
         files_created = 0
 
@@ -372,6 +511,7 @@ class DiamondCatalogProcessor:
                 country_data = combined_df.copy()
                 country_data['id'] = country_data['id'].str.replace(r'CA$', country, regex=True)
 
+                # Convert CAD amounts to target currency: (target_per_USD / CAD_per_USD)
                 target_rate = Decimal(str(rates[currency]))
                 cad_to_target = (target_rate / usd_to_cad)
 
@@ -382,9 +522,10 @@ class DiamondCatalogProcessor:
                 country_data['price'] = country_data['price_numeric'].map(lambda x: self.format_price(x, currency))
                 country_data.drop(columns=['price_numeric'], inplace=True, errors='ignore')
 
-                output_file = os.path.join(self.output_folder, f"{country}-pinterest-csv.csv")
                 # Final guard: keep only rows with valid price format
                 country_data = country_data[country_data['price'].astype(str).str.match(r'^\d+\.\d{2}\s[A-Z]{3}$', na=False)]
+
+                output_file = os.path.join(self.output_folder, f"{country}-pinterest-csv.csv")
                 country_data.to_csv(output_file, index=False, encoding='utf-8')
 
                 logger.info(f"Created {country} file with {len(country_data)} products")
