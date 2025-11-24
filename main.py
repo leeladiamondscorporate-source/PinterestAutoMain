@@ -1,15 +1,13 @@
 import os
 import re
-import ftplib
 import pandas as pd
 import requests
 from google.cloud import storage
 import random
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import time
 from decimal import Decimal, ROUND_HALF_UP
-from typing import List
 
 # Configure logging
 logging.basicConfig(
@@ -24,6 +22,7 @@ logger = logging.getLogger(__name__)
 # ----------------------------
 IMG_RE = re.compile(r'(https?://[^\s",>]+?\.(?:jpg|jpeg|png|webp))', re.IGNORECASE)
 
+
 def extract_image_series(df: pd.DataFrame, col_name: str) -> pd.Series:
     """
     Always returns a pandas Series of strings (no ndarray).
@@ -35,6 +34,7 @@ def extract_image_series(df: pd.DataFrame, col_name: str) -> pd.Series:
         lambda s: (IMG_RE.search(s).group(0) if IMG_RE.search(s) else "")
     )
 
+
 def parse_money_to_float(series: pd.Series) -> pd.Series:
     """
     Parse money-like strings to floats. Strips currency words/symbols, commas,
@@ -45,7 +45,12 @@ def parse_money_to_float(series: pd.Series) -> pd.Series:
             return None
         s = str(v).strip()
         s = s.replace(",", "")
-        s = re.sub(r"(usd|cad|inr|aud|eur|gbp|jpy|chf|sek|mxn|brl|sgd|hkd|nzd|dkk|nok|£|€|\$)", "", s, flags=re.IGNORECASE)
+        s = re.sub(
+            r"(usd|cad|inr|aud|eur|gbp|jpy|chf|sek|mxn|brl|sgd|hkd|nzd|dkk|nok|£|€|\$)",
+            "",
+            s,
+            flags=re.IGNORECASE,
+        )
         s = re.sub(r"[^0-9.\-]", "", s)
         if s.count(".") > 1:
             parts = s.split(".")
@@ -54,6 +59,7 @@ def parse_money_to_float(series: pd.Series) -> pd.Series:
             return float(s) if s != "" else None
         except Exception:
             return None
+
     out = series.map(_clean)
     return pd.to_numeric(out, errors="coerce")
 
@@ -62,34 +68,42 @@ class DiamondCatalogProcessor:
     """Pinterest feed generator with robust parsing, pricing, and country files."""
 
     def __init__(self):
-        # FTP Configuration - Use environment variables for security
-        self.ftp_config = {
-            "server": os.environ.get("FTP_SERVER", "ftp.nivoda.net"),
-            "port": int(os.environ.get("FTP_PORT", "21")),
-            "username": os.environ.get("FTP_USERNAME", "leeladiamondscorporate@gmail.com"),
-            "password": os.environ.get("FTP_PASSWORD", "1yH£lG4n0Mq"),
-        }
-
         # Directories
-        self.ftp_download_dir = os.environ.get("FTP_DOWNLOAD_DIR", "/tmp/raw")
+        self.download_dir = os.environ.get("DOWNLOAD_DIR", "/tmp/raw")
         self.output_folder = os.environ.get("OUTPUT_FOLDER", "/tmp/pinterest_output")
 
-        os.makedirs(self.ftp_download_dir, exist_ok=True)
+        os.makedirs(self.download_dir, exist_ok=True)
         os.makedirs(self.output_folder, exist_ok=True)
 
-        # FTP file mappings
-        self.ftp_files = {
+        # Nivoda direct download URLs (overridable by env for safety)
+        self.download_urls = {
+            "natural": os.environ.get(
+                "NIVODA_NATURAL_URL",
+                "https://g.nivoda.com/feeds-api/ftpdownload/12",
+            ),
+            "lab_grown": os.environ.get(
+                "NIVODA_LABGROWN_URL",
+                "https://g.nivoda.com/feeds-api/ftpdownload/4e8",
+            ),
+            "gemstone": os.environ.get(
+                "NIVODA_GEMSTONE_URL",
+                "https://g.nivoda.com/feeds-api/ftpdownload/1dd",
+            ),
+        }
+
+        # Local file paths for the downloaded CSVs
+        self.source_files = {
             "natural": {
-                "remote_filename": "Leela Diamond_natural.csv",
-                "local_path": os.path.join(self.ftp_download_dir, "Natural.csv"),
+                "url": self.download_urls["natural"],
+                "local_path": os.path.join(self.download_dir, "Natural.csv"),
             },
             "lab_grown": {
-                "remote_filename": "Leela Diamond_labgrown.csv",
-                "local_path": os.path.join(self.ftp_download_dir, "Labgrown.csv"),
+                "url": self.download_urls["lab_grown"],
+                "local_path": os.path.join(self.download_dir, "Labgrown.csv"),
             },
             "gemstone": {
-                "remote_filename": "Leela Diamond_gemstones.csv",
-                "local_path": os.path.join(self.ftp_download_dir, "gemstones.csv"),
+                "url": self.download_urls["gemstone"],
+                "local_path": os.path.join(self.download_dir, "gemstones.csv"),
             },
         }
 
@@ -119,37 +133,36 @@ class DiamondCatalogProcessor:
         ]
 
     # ----------------------------
-    # FTP
+    # Download via HTTPS (no FTP)
     # ----------------------------
-    def download_file_from_ftp(self, remote_filename: str, local_path: str, max_retries: int = 3) -> bool:
+    def download_file_from_web(self, label: str, url: str, local_path: str, max_retries: int = 3) -> bool:
         for attempt in range(max_retries):
             try:
-                with ftplib.FTP() as ftp:
-                    ftp.connect(self.ftp_config["server"], self.ftp_config["port"], timeout=30)
-                    ftp.login(self.ftp_config["username"], self.ftp_config["password"])
-                    ftp.set_pasv(True)
-                    with open(local_path, 'wb') as f:
-                        ftp.retrbinary(f"RETR {remote_filename}", f.write)
-                logger.info(f"Successfully downloaded {remote_filename} to {local_path}")
+                logger.info(f"[HTTP] Downloading {label} from {url}")
+                resp = requests.get(url, timeout=120)
+                resp.raise_for_status()
+                with open(local_path, "wb") as f:
+                    f.write(resp.content)
+                logger.info(f"[HTTP] Saved {label} → {local_path}")
                 return True
             except Exception as e:
-                logger.warning(f"Attempt {attempt + 1} failed downloading {remote_filename}: {e}")
+                logger.warning(f"[HTTP] Attempt {attempt + 1} failed for {label}: {e}")
                 if attempt < max_retries - 1:
                     time.sleep(2 ** attempt)
                 else:
-                    logger.error(f"Failed to download {remote_filename} after {max_retries} attempts")
+                    logger.error(f"[HTTP] Failed to download {label} after {max_retries} attempts")
         return False
 
     def download_all_files(self) -> bool:
-        logger.info("Starting FTP download process...")
+        logger.info("Starting HTTPS download process from Nivoda direct links...")
         success_count = 0
-        for product_type, file_info in self.ftp_files.items():
-            if self.download_file_from_ftp(file_info["remote_filename"], file_info["local_path"]):
+        for product_type, file_info in self.source_files.items():
+            if self.download_file_from_web(product_type, file_info["url"], file_info["local_path"]):
                 success_count += 1
             else:
                 logger.error(f"Failed to download {product_type} file")
-        logger.info(f"Downloaded {success_count}/{len(self.ftp_files)} files successfully")
-        return success_count == len(self.ftp_files)
+        logger.info(f"Downloaded {success_count}/{len(self.source_files)} files successfully")
+        return success_count == len(self.source_files)
 
     # ----------------------------
     # Pricing / Currency
@@ -189,7 +202,7 @@ class DiamondCatalogProcessor:
         df = df.fillna('')
 
         # Require valid image for Pinterest
-        img_series = extract_image_series(df, 'image') if 'image' in df.columns else pd.Series(['']*len(df))
+        img_series = extract_image_series(df, 'image') if 'image' in df.columns else pd.Series([''] * len(df))
         before = len(df)
         df = df[img_series.str.len() > 0].copy()
         df['image'] = extract_image_series(df, 'image')
@@ -255,7 +268,7 @@ class DiamondCatalogProcessor:
 
         # Try direct price candidates
         for cand in price_candidates:
-            series = parse_money_to_float(df[cand]) if cand in df.columns else pd.Series([None]*len(df))
+            series = parse_money_to_float(df[cand]) if cand in df.columns else pd.Series([None] * len(df))
             take = price_usd.isna() & series.notna() & (series > 0)
             price_usd.loc[take] = series.loc[take]
             used_source.loc[take] = cand
@@ -263,7 +276,7 @@ class DiamondCatalogProcessor:
         # Fallback: price_per_carat * carats
         missing = price_usd.isna() | (price_usd <= 0)
         if missing.any():
-            ppc = parse_money_to_float(df[ppc_col]) if ppc_col in df.columns else pd.Series([None]*len(df))
+            ppc = parse_money_to_float(df[ppc_col]) if ppc_col in df.columns else pd.Series([None] * len(df))
             carats = pd.to_numeric(df[carats_col], errors="coerce")
             ppc_total = (ppc * carats).where(ppc.notna() & carats.notna(), other=None)
             take_ppc = missing & ppc_total.notna() & (ppc_total > 0)
@@ -288,7 +301,11 @@ class DiamondCatalogProcessor:
         price_cad = pd.Series([to_cad(p, c) for p, c in zip(price_usd, curr)], index=df.index)
         price_cad = pd.to_numeric(price_cad, errors="coerce").fillna(0.0)
 
-        logger.info(f"[PRICE][{product_type}] rows={len(df)} | priced(>0 CAD)={(price_cad > 0).sum()} | sources={used_source.value_counts(dropna=False).to_dict()}")
+        logger.info(
+            f"[PRICE][{product_type}] rows={len(df)} | "
+            f"priced(>0 CAD)={(price_cad > 0).sum()} | "
+            f"sources={used_source.value_counts(dropna=False).to_dict()}"
+        )
         return price_cad
 
     # ----------------------------
@@ -313,12 +330,23 @@ class DiamondCatalogProcessor:
                 return pd.DataFrame()
 
             # Ensure common columns exist
-            base_cols = ["shape","carats","col","clar","cut","pol","symm","flo","floCol",
-                         "length","width","height","depth","table","culet","lab","girdle",
-                         "ReportNo","image","video","pdf","diamondId","stockId","ID"]
-            gemstone_only = ["gemType","Treatment","Mine of Origin","mine_of_origin","mineOfOrigin","pdfUrl","price_per_carat","markup_price","markup_currency"]
-            natural_only  = ["price_per_carat","markup_price","markup_currency","mine_of_origin","canada_mark_eligible","is_returnable","delivered_price"]
-            lab_only      = ["pricePerCarat","markupPrice","markupCurrency","deliveredPrice","minDeliveryDays","maxDeliveryDays","mineOfOrigin","price"]
+            base_cols = [
+                "shape","carats","col","clar","cut","pol","symm","flo","floCol",
+                "length","width","height","depth","table","culet","lab","girdle",
+                "ReportNo","image","video","pdf","diamondId","stockId","ID"
+            ]
+            gemstone_only = [
+                "gemType","Treatment","Mine of Origin","mine_of_origin","mineOfOrigin",
+                "pdfUrl","price_per_carat","markup_price","markup_currency"
+            ]
+            natural_only  = [
+                "price_per_carat","markup_price","markup_currency","mine_of_origin",
+                "canada_mark_eligible","is_returnable","delivered_price"
+            ]
+            lab_only      = [
+                "pricePerCarat","markupPrice","markupCurrency","deliveredPrice",
+                "minDeliveryDays","maxDeliveryDays","mineOfOrigin","price"
+            ]
 
             ensure_cols = set(base_cols + gemstone_only + natural_only + lab_only)
             for c in ensure_cols:
@@ -348,7 +376,9 @@ class DiamondCatalogProcessor:
             df["ReportNo"] = df["ReportNo"].astype(str).str.strip()
             if product_type == "gemstone" and (df["ReportNo"] == "").all():
                 df["ReportNo"] = df["ID"].astype(str)
-            df["id"] = (df["ReportNo"].where(df["ReportNo"] != "", df["diamondId"].astype(str)) + "CA").fillna("")
+            df["id"] = (
+                df["ReportNo"].where(df["ReportNo"] != "", df["diamondId"].astype(str)) + "CA"
+            ).fillna("")
 
             # Product info (titles/desc/links)
             df = self.apply_product_templates(df, product_type)
@@ -357,7 +387,11 @@ class DiamondCatalogProcessor:
             df = self.add_pinterest_fields(df)
 
             # Final safety: ensure valid price string
-            df = df[df["price"].astype(str).str.match(r'^\d+\.\d{2}\s[A-Z]{3}$', na=False)]
+            df = df[
+                df["price"]
+                .astype(str)
+                .str.match(r'^\d+\.\d{2}\s[A-Z]{3}$', na=False)
+            ]
 
             logger.info(f"Successfully processed {len(df)} {product_type} products")
             return df
@@ -368,14 +402,22 @@ class DiamondCatalogProcessor:
 
     def apply_product_templates(self, df: pd.DataFrame, product_type: str) -> pd.DataFrame:
         def meas(row):
-            L = row.get("length"); W = row.get("width"); H = row.get("height") or row.get("depth")
-            if L and W and H: return f"{L}-{W}x{H} mm"
-            if L and W:       return f"{L}x{W} mm"
+            L = row.get("length")
+            W = row.get("width")
+            H = row.get("height") or row.get("depth")
+            if L and W and H:
+                return f"{L}-{W}x{H} mm"
+            if L and W:
+                return f"{L}x{W} mm"
             return ""
 
         product_templates = {
             "natural": {
-                "title": lambda row: f"{row.get('shape', 'DIAMOND')} {row.get('carats', '')} Carats {row.get('col', '')} Color {row.get('clar', '')} Clarity {row.get('lab', '')} Certified Natural Diamond",
+                "title": lambda row: (
+                    f"{row.get('shape', 'DIAMOND')} {row.get('carats', '')} Carats "
+                    f"{row.get('col', '')} Color {row.get('clar', '')} Clarity "
+                    f"{row.get('lab', '')} Certified Natural Diamond"
+                ),
                 "description": lambda row: (
                     f"Natural {row.get('shape','')} diamond: {row.get('carats','')} carats, "
                     f"{row.get('col','')} color, {row.get('clar','')} clarity. "
@@ -383,7 +425,9 @@ class DiamondCatalogProcessor:
                     f"Table: {row.get('table','')}%, Depth: {row.get('depth','')}%, Fluorescence: {row.get('flo','') or row.get('floCol','')}. "
                     f"{row.get('lab','')} certified."
                 ),
-                "link": lambda row: f"https://leeladiamond.com/pages/natural-diamond-catalog?id={row.get('ReportNo', '')}",
+                "link": lambda row: (
+                    f"https://leeladiamond.com/pages/natural-diamond-catalog?id={row.get('ReportNo', '')}"
+                ),
             },
             "lab_grown": {
                 "title": lambda row: (
@@ -410,8 +454,10 @@ class DiamondCatalogProcessor:
             },
             "gemstone": {
                 "title": lambda row: (
-                    f"{row.get('gemType', 'Gemstone')} {row.get('Color', '')} {row.get('shape', '')} – "
-                    f"{row.get('carats', '')} Carats, {row.get('Clarity', '')} Clarity, {row.get('Cut', '')} Cut, {row.get('Lab', '')} Certified"
+                    f"{row.get('gemType', 'Gemstone')} {row.get('Color', '')} "
+                    f"{row.get('shape', '')} – {row.get('carats', '')} Carats, "
+                    f"{row.get('Clarity', '')} Clarity, {row.get('Cut', '')} Cut, "
+                    f"{row.get('Lab', '')} Certified"
                 ),
                 "description": lambda row: (
                     f"{row.get('gemType','')} gemstone in {row.get('Color','')} color, "
@@ -420,7 +466,10 @@ class DiamondCatalogProcessor:
                     f"Treatment: {(row.get('Treatment','') or 'N/A')}. "
                     f"{'Origin: ' + row.get('Mine of Origin','') if row.get('Mine of Origin','') else ''}"
                 ),
-                "link": lambda row: f"https://leeladiamond.com/pages/gemstone-catalog?id={row.get('ReportNo', '') or row.get('ID','')}",
+                "link": lambda row: (
+                    "https://leeladiamond.com/pages/gemstone-catalog?"
+                    f"id={row.get('ReportNo', '') or row.get('ID','')}"
+                ),
             },
         }
 
@@ -441,8 +490,12 @@ class DiamondCatalogProcessor:
         num_rows = len(df)
         df['image_link'] = df['image']
         df['availability'] = 'in stock'
-        df['google_product_category'] = [random.choice(self.jewelry_categories) for _ in range(num_rows)]
-        df['average_review_rating'] = [round(random.uniform(4.0, 5.0), 1) for _ in range(num_rows)]
+        df['google_product_category'] = [
+            random.choice(self.jewelry_categories) for _ in range(num_rows)
+        ]
+        df['average_review_rating'] = [
+            round(random.uniform(4.0, 5.0), 1) for _ in range(num_rows)
+        ]
         df['number_of_ratings'] = [random.randint(5, 50) for _ in range(num_rows)]
         df['condition'] = 'new'
         return df
@@ -462,9 +515,14 @@ class DiamondCatalogProcessor:
                         logger.info("Successfully fetched exchange rates")
                         return data["conversion_rates"]
                     else:
-                        logger.error(f"Exchange rate API error: {data.get('error-type', 'Unknown error')}")
+                        logger.error(
+                            f"Exchange rate API error: "
+                            f"{data.get('error-type', 'Unknown error')}"
+                        )
                 else:
-                    logger.error(f"HTTP error fetching exchange rates: {response.status_code}")
+                    logger.error(
+                        f"HTTP error fetching exchange rates: {response.status_code}"
+                    )
             except requests.exceptions.Timeout:
                 logger.warning(f"Timeout fetching exchange rates (attempt {attempt + 1})")
             except Exception as e:
@@ -505,27 +563,45 @@ class DiamondCatalogProcessor:
         for country, currency in self.country_currency.items():
             try:
                 if currency not in rates:
-                    logger.warning(f"Exchange rate not available for {currency}, skipping {country}")
+                    logger.warning(
+                        f"Exchange rate not available for {currency}, skipping {country}"
+                    )
                     continue
 
                 country_data = combined_df.copy()
-                country_data['id'] = country_data['id'].str.replace(r'CA$', country, regex=True)
+                country_data['id'] = country_data['id'].str.replace(
+                    r'CA$', country, regex=True
+                )
 
                 # Convert CAD amounts to target currency: (target_per_USD / CAD_per_USD)
                 target_rate = Decimal(str(rates[currency]))
                 cad_to_target = (target_rate / usd_to_cad)
 
-                country_data['price_numeric'] = country_data['price'].apply(self._parse_price_number)
-                country_data['price_numeric'] = country_data['price_numeric'].apply(
-                    lambda x: float((Decimal(str(x)) * cad_to_target).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+                country_data['price_numeric'] = country_data['price'].apply(
+                    self._parse_price_number
                 )
-                country_data['price'] = country_data['price_numeric'].map(lambda x: self.format_price(x, currency))
+                country_data['price_numeric'] = country_data['price_numeric'].apply(
+                    lambda x: float(
+                        (Decimal(str(x)) * cad_to_target).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_UP
+                        )
+                    )
+                )
+                country_data['price'] = country_data['price_numeric'].map(
+                    lambda x: self.format_price(x, currency)
+                )
                 country_data.drop(columns=['price_numeric'], inplace=True, errors='ignore')
 
                 # Final guard: keep only rows with valid price format
-                country_data = country_data[country_data['price'].astype(str).str.match(r'^\d+\.\d{2}\s[A-Z]{3}$', na=False)]
+                country_data = country_data[
+                    country_data['price']
+                    .astype(str)
+                    .str.match(r'^\d+\.\d{2}\s[A-Z]{3}$', na=False)
+                ]
 
-                output_file = os.path.join(self.output_folder, f"{country}-pinterest-csv.csv")
+                output_file = os.path.join(
+                    self.output_folder, f"{country}-pinterest-csv.csv"
+                )
                 country_data.to_csv(output_file, index=False, encoding='utf-8')
 
                 logger.info(f"Created {country} file with {len(country_data)} products")
@@ -549,7 +625,9 @@ class DiamondCatalogProcessor:
                 file_path = os.path.join(self.output_folder, file_name)
                 if os.path.isfile(file_path):
                     try:
-                        destination_blob_name = f"{self.gcs_config['bucket_folder'].rstrip('/')}/{file_name}"
+                        destination_blob_name = (
+                            f"{self.gcs_config['bucket_folder'].rstrip('/')}/{file_name}"
+                        )
                         blob = bucket.blob(destination_blob_name)
                         blob.upload_from_filename(file_path)
                         logger.info(f"Uploaded {file_name} to GCS")
@@ -571,11 +649,11 @@ class DiamondCatalogProcessor:
             logger.info("Starting Diamond Catalog Processing...")
 
             if not self.download_all_files():
-                logger.error("Failed to download required files from FTP")
+                logger.error("Failed to download required files from Nivoda direct links")
                 return False
 
             dataframes = []
-            for product_type, file_info in self.ftp_files.items():
+            for product_type, file_info in self.source_files.items():
                 df = self.process_file(file_info["local_path"], product_type)
                 if not df.empty:
                     dataframes.append(df)
@@ -600,10 +678,16 @@ class DiamondCatalogProcessor:
 
             # Final enforcement: keep only rows with a valid ISO-4217 price string
             before_final = len(combined_df)
-            combined_df = combined_df[combined_df['price'].astype(str).str.match(r'^\d+\.\d{2}\s[A-Z]{3}$', na=False)]
+            combined_df = combined_df[
+                combined_df['price']
+                .astype(str)
+                .str.match(r'^\d+\.\d{2}\s[A-Z]{3}$', na=False)
+            ]
             after_final = len(combined_df)
             if before_final != after_final:
-                logger.info(f"Removed {before_final - after_final} rows lacking a valid formatted price")
+                logger.info(
+                    f"Removed {before_final - after_final} rows lacking a valid formatted price"
+                )
 
             combined_file = os.path.join(self.output_folder, "combined_catalog.csv")
             combined_df.to_csv(combined_file, index=False, encoding='utf-8')
