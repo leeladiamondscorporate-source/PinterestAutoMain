@@ -79,15 +79,15 @@ class DiamondCatalogProcessor:
         self.download_urls = {
             "natural": os.environ.get(
                 "NIVODA_NATURAL_URL",
-                "https://g.nivoda.com/feeds-api/ftpdownload/12",
+                "https://g.nivoda.com/feeds-api/ftpdownload/1268df58-e992-455c-8be9-bb9b8abeeea0",
             ),
             "lab_grown": os.environ.get(
                 "NIVODA_LABGROWN_URL",
-                "https://g.nivoda.com/feeds-api/ftpdownload/4e8",
+                "https://g.nivoda.com/feeds-api/ftpdownload/4e87471c-ae7c-443d-a923-ee51a510b5fa",
             ),
             "gemstone": os.environ.get(
                 "NIVODA_GEMSTONE_URL",
-                "https://g.nivoda.com/feeds-api/ftpdownload/1dd",
+                "https://g.nivoda.com/feeds-api/ftpdownload/1dddf473-d048-48ec-97bb-971cfae092b6",
             ),
         }
 
@@ -715,3 +715,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
